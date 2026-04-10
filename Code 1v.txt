@@ -1,0 +1,1112 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+from dataclasses import dataclass, field
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+from typing import List, Optional, Dict, Tuple
+
+
+NY_TZ = ZoneInfo("America/New_York")
+UTC_TZ = ZoneInfo("UTC")
+
+
+@dataclass
+class Bar:
+    ts: datetime  # UTC
+    open: float
+    high: float
+    low: float
+    close: float
+
+
+@dataclass
+class RiskTier:
+    min_score: int
+    risk_pct: float
+    label: str
+
+
+@dataclass
+class StrategyConfig:
+    symbol: str = "NQ"
+    account_size: float = 50_000.0
+
+    base_risk_pct: float = 0.005
+    max_risk_pct: float = 0.02
+    risk_tiers: List[RiskTier] = field(
+        default_factory=lambda: [
+            RiskTier(90, 0.020, "ELITE"),
+            RiskTier(75, 0.015, "STRONG"),
+            RiskTier(60, 0.010, "MODERATE"),
+            RiskTier(50, 0.005, "STANDARD"),
+        ]
+    )
+
+    atr_period: int = 14
+    atr_multiplier_sl: float = 1.5
+    atr_expansion_window: int = 5
+    atr_expansion_threshold: float = 1.3
+
+    tp1_ratio: float = 1.5
+    tp2_ratio: float = 2.5
+    tp3_ratio: float = 4.0
+    tp1_size: float = 0.40
+    tp2_size: float = 0.40
+    tp3_size: float = 0.20
+
+    ob_lookback: int = 10
+    fvg_min_size: float = 5.0
+    liq_lookback: int = 20
+    mss_confirm_bars: int = 2
+    min_score: int = 50
+
+    trade_only_kill_zone: bool = True
+    kill_zones: Tuple[Tuple[time, time], ...] = (
+        (time(3, 0), time(5, 0)),
+        (time(9, 30), time(11, 0)),
+        (time(13, 30), time(15, 0)),
+    )
+
+    # improvements from simulation
+    slippage_ticks: int = 2
+    commission_per_contract: float = 2.5
+    tick_size: float = 0.25
+    tick_value: float = 5.0
+
+    max_daily_loss: float = 1500.0
+    max_consecutive_losses: int = 3
+    require_regime_for_aggressive_tiers: bool = True
+
+
+@dataclass
+class Signal:
+    direction: Optional[str]
+    score: int
+    reasons: List[str]
+
+
+@dataclass
+class Position:
+    is_long: bool
+    qty: int
+    entry: float
+    stop: float
+    tp1: float
+    tp2: float
+    tp3: float
+    tier: str
+    score: int
+    opened_at: datetime
+    tp1_hit: bool = False
+    tp2_hit: bool = False
+
+
+@dataclass
+class TradeLog:
+    opened_at: datetime
+    closed_at: datetime
+    direction: str
+    qty: int
+    score: int
+    tier: str
+    gross_pnl: float
+    net_pnl: float
+    r_multiple: float
+    reason: str
+
+
+class Backtester:
+    def __init__(self, cfg: StrategyConfig, bars_5m: List[Bar], bars_1h: List[Bar]):
+        self.cfg = cfg
+        self.bars_5m = bars_5m
+        self.bars_1h = bars_1h
+        self.h1_by_time = {b.ts: b for b in bars_1h}
+
+        self.equity = cfg.account_size
+        self.position: Optional[Position] = None
+        self.logs: List[TradeLog] = []
+
+        self.current_day = None
+        self.day_start_equity = self.equity
+        self.consecutive_losses = 0
+        self.day_locked = False
+
+    # ---------- indicators ----------
+    def calc_atr(self, bars: List[Bar], period: int) -> Optional[float]:
+        if len(bars) < period + 1:
+            return None
+        trs = []
+        for i in range(len(bars) - period, len(bars)):
+            h, l, pc = bars[i].high, bars[i].low, bars[i - 1].close
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        return sum(trs) / period
+
+    def get_htf_bias(self, htf_slice: List[Bar]) -> str:
+        if len(htf_slice) < 21:
+            return "NEUTRAL"
+        ema = htf_slice[0].close
+        k = 2 / 21
+        for bar in htf_slice[1:]:
+            ema = bar.close * k + ema * (1 - k)
+        last = htf_slice[-1].close
+        if last > ema * 1.002:
+            return "BULLISH"
+        if last < ema * 0.998:
+            return "BEARISH"
+        return "NEUTRAL"
+
+    def get_htf_slope(self, htf_slice: List[Bar], lookback: int = 8) -> float:
+        if len(htf_slice) < lookback:
+            return 0.0
+        return htf_slice[-1].close - htf_slice[-lookback].close
+
+    def detect_order_blocks(self, bars: List[Bar]) -> Dict[str, Optional[Dict[str, float]]]:
+        result = {"bullish": None, "bearish": None}
+        if len(bars) < self.cfg.ob_lookback + 3:
+            return result
+        for i in range(len(bars) - self.cfg.ob_lookback, len(bars) - 2):
+            c, n, n2 = bars[i], bars[i + 1], bars[i + 2]
+            if c.close < c.open and n.close > c.high and n2.close > n.high:
+                result["bullish"] = {"high": c.high, "low": c.low}
+            if c.close > c.open and n.close < c.low and n2.close < n.low:
+                result["bearish"] = {"high": c.high, "low": c.low}
+        return result
+
+    def detect_fvg(self, bars: List[Bar]) -> Dict[str, Optional[Dict[str, float]]]:
+        result = {"bullish": None, "bearish": None}
+        if len(bars) < 4:
+            return result
+        for i in range(len(bars) - 4, len(bars) - 2):
+            prev, nxt = bars[i], bars[i + 2]
+            if nxt.low - prev.high >= self.cfg.fvg_min_size:
+                result["bullish"] = {"bottom": prev.high, "top": nxt.low}
+            if prev.low - nxt.high >= self.cfg.fvg_min_size:
+                result["bearish"] = {"bottom": nxt.high, "top": prev.low}
+        return result
+
+    def detect_liquidity_sweep(self, bars: List[Bar]) -> Dict[str, Optional[float]]:
+        out = {"swept_high": False, "swept_low": False, "high_level": None, "low_level": None}
+        if len(bars) < self.cfg.liq_lookback + 2:
+            return out
+
+        hi = max(b.high for b in bars[-self.cfg.liq_lookback - 1 : -1])
+        lo = min(b.low for b in bars[-self.cfg.liq_lookback - 1 : -1])
+        c = bars[-1]
+        if c.high > hi and c.close < hi:
+            out["swept_high"] = True
+            out["high_level"] = hi
+        if c.low < lo and c.close > lo:
+            out["swept_low"] = True
+            out["low_level"] = lo
+        return out
+
+    def detect_mss(self, bars: List[Bar]) -> Optional[str]:
+        n = len(bars)
+        if n < 10:
+            return None
+        swing_high, swing_low = -math.inf, math.inf
+        for i in range(n - 8, n - self.cfg.mss_confirm_bars):
+            b = bars[i]
+            if b.high > bars[i - 1].high and b.high > bars[i + 1].high:
+                swing_high = b.high
+            if b.low < bars[i - 1].low and b.low < bars[i + 1].low:
+                swing_low = b.low
+
+        above = all(bars[i].close > swing_high for i in range(n - self.cfg.mss_confirm_bars, n)) if swing_high != -math.inf else False
+        below = all(bars[i].close < swing_low for i in range(n - self.cfg.mss_confirm_bars, n)) if swing_low != math.inf else False
+
+        if above:
+            return "BULLISH_MSS"
+        if below:
+            return "BEARISH_MSS"
+        return None
+
+    def score_setup(self, bias: str, ob: dict, fvg: dict, liq: dict, mss: Optional[str]) -> Signal:
+        score = 0
+        reasons = []
+
+        if bias == "BULLISH":
+            if ob["bullish"]:
+                score += 25
+                reasons.append("Bullish OB")
+            if fvg["bullish"]:
+                score += 25
+                reasons.append("Bullish FVG")
+            if liq["swept_low"]:
+                score += 25
+                reasons.append("Buy-side liquidity sweep")
+            if mss == "BULLISH_MSS":
+                score += 25
+                reasons.append("Bullish MSS")
+            return Signal("LONG" if score >= self.cfg.min_score else None, score, reasons)
+
+        if bias == "BEARISH":
+            if ob["bearish"]:
+                score += 25
+                reasons.append("Bearish OB")
+            if fvg["bearish"]:
+                score += 25
+                reasons.append("Bearish FVG")
+            if liq["swept_high"]:
+                score += 25
+                reasons.append("Sell-side liquidity sweep")
+            if mss == "BEARISH_MSS":
+                score += 25
+                reasons.append("Bearish MSS")
+            return Signal("SHORT" if score >= self.cfg.min_score else None, score, reasons)
+
+        return Signal(None, score, reasons)
+
+    def analyze_trend(self, ltf_slice: List[Bar], htf_slice: List[Bar], signal: Signal) -> Dict[str, float | bool | str]:
+        atr = self.calc_atr(ltf_slice, self.cfg.atr_period) or 10.0
+
+        recent_atr = 0.0
+        if len(ltf_slice) >= self.cfg.atr_expansion_window + 1:
+            tr_sum = 0.0
+            for i in range(len(ltf_slice) - self.cfg.atr_expansion_window, len(ltf_slice)):
+                h, l, pc = ltf_slice[i].high, ltf_slice[i].low, ltf_slice[i - 1].close
+                tr_sum += max(h - l, abs(h - pc), abs(l - pc))
+            recent_atr = tr_sum / self.cfg.atr_expansion_window
+
+        atr_expansion = (recent_atr / atr) if recent_atr > 0 else 1.0
+        is_trending = atr_expansion >= self.cfg.atr_expansion_threshold
+
+        score_factor = 1 + signal.score / 100
+        projected_move = atr * self.cfg.tp2_ratio * score_factor * (atr_expansion if is_trending else 1.0)
+
+        if signal.score >= 90:
+            strength = "ELITE"
+        elif signal.score >= 75:
+            strength = "STRONG"
+        elif signal.score >= 60:
+            strength = "MODERATE"
+        elif signal.score >= 50:
+            strength = "STANDARD"
+        else:
+            strength = "WEAK"
+
+        htf_slope = self.get_htf_slope(htf_slice)
+
+        return {
+            "atr": atr,
+            "atr_expansion": atr_expansion,
+            "is_trending": is_trending,
+            "projected_move": projected_move,
+            "strength": strength,
+            "htf_slope": htf_slope,
+        }
+
+    # ---------- risk ----------
+    def in_kill_zone(self, ts_utc: datetime) -> bool:
+        if not self.cfg.trade_only_kill_zone:
+            return True
+        local_t = ts_utc.astimezone(NY_TZ).time()
+        return any(start <= local_t <= end for start, end in self.cfg.kill_zones)
+
+    def day_guardrails(self, ts_utc: datetime) -> bool:
+        day = ts_utc.astimezone(NY_TZ).date()
+        if day != self.current_day:
+            self.current_day = day
+            self.day_start_equity = self.equity
+            self.day_locked = False
+            self.consecutive_losses = 0
+
+        daily_pnl = self.equity - self.day_start_equity
+        if daily_pnl <= -abs(self.cfg.max_daily_loss):
+            self.day_locked = True
+        if self.consecutive_losses >= self.cfg.max_consecutive_losses:
+            self.day_locked = True
+
+        return not self.day_locked
+
+    def pick_tier(self, score: int) -> RiskTier:
+        for tier in self.cfg.risk_tiers:
+            if score >= tier.min_score:
+                return tier
+        return self.cfg.risk_tiers[-1]
+
+    def allow_aggressive_tier(self, tier: RiskTier, trend: dict, signal: Signal) -> bool:
+        if not self.cfg.require_regime_for_aggressive_tiers:
+            return True
+        if tier.label not in {"ELITE", "STRONG"}:
+            return True
+
+        # Require ATR expansion + direction-aligned HTF slope
+        slope = trend["htf_slope"]
+        direction_ok = (signal.direction == "LONG" and slope > 0) or (signal.direction == "SHORT" and slope < 0)
+        return bool(trend["is_trending"] and direction_ok)
+
+    def size_position(self, score: int, atr: float, trend: dict, signal: Signal) -> Tuple[int, RiskTier, float, float]:
+        tier = self.pick_tier(score)
+        if not self.allow_aggressive_tier(tier, trend, signal):
+            tier = RiskTier(60, 0.010, "MODERATE") if score >= 60 else RiskTier(50, 0.005, "STANDARD")
+
+        expansion_mult = min(1.5, trend["atr_expansion"]) if trend["is_trending"] else 1.0
+        risk_pct = min(tier.risk_pct * expansion_mult, self.cfg.max_risk_pct)
+
+        risk_amount = self.equity * risk_pct
+        sl_distance = atr * self.cfg.atr_multiplier_sl
+        sl_ticks = max(1, round(sl_distance / self.cfg.tick_size))
+        per_contract_risk = sl_ticks * self.cfg.tick_value
+        qty = max(1, int(risk_amount // per_contract_risk))
+
+        return qty, tier, risk_pct, sl_distance
+
+    # ---------- execution ----------
+    def apply_slippage(self, price: float, is_long: bool, is_entry: bool) -> float:
+        slip = self.cfg.slippage_ticks * self.cfg.tick_size
+        if is_entry:
+            return price + slip if is_long else price - slip
+        return price - slip if is_long else price + slip
+
+    def open_position(self, bar: Bar, signal: Signal, ob: dict, fvg: dict, trend: dict):
+        is_long = signal.direction == "LONG"
+        ref = (
+            (ob["bullish"]["high"] if ob["bullish"] else (fvg["bullish"]["bottom"] if fvg["bullish"] else bar.close))
+            if is_long
+            else (ob["bearish"]["low"] if ob["bearish"] else (fvg["bearish"]["top"] if fvg["bearish"] else bar.close))
+        )
+
+        qty, tier, _, sl_dist = self.size_position(signal.score, float(trend["atr"]), trend, signal)
+        tp_mult = min(1.5, float(trend["atr_expansion"])) if trend["is_trending"] else 1.0
+
+        raw_entry = ref
+        entry = self.apply_slippage(raw_entry, is_long=is_long, is_entry=True)
+        stop = entry - sl_dist if is_long else entry + sl_dist
+        tp1 = entry + sl_dist * self.cfg.tp1_ratio if is_long else entry - sl_dist * self.cfg.tp1_ratio
+        tp2 = entry + sl_dist * self.cfg.tp2_ratio * tp_mult if is_long else entry - sl_dist * self.cfg.tp2_ratio * tp_mult
+        tp3 = entry + sl_dist * self.cfg.tp3_ratio * tp_mult * 1.2 if is_long else entry - sl_dist * self.cfg.tp3_ratio * tp_mult * 1.2
+
+        self.position = Position(is_long, qty, entry, stop, tp1, tp2, tp3, tier.label, signal.score, bar.ts)
+
+    def _close_leg(self, exit_price: float, qty: int, reason: str, bar: Bar, final_close: bool = False):
+        assert self.position is not None
+        p = self.position
+        signed = 1 if p.is_long else -1
+        slipped_exit = self.apply_slippage(exit_price, is_long=p.is_long, is_entry=False)
+        gross = (slipped_exit - p.entry) * signed * (qty * 4)  # $4/point/contract equivalent from provided script
+        fees = qty * self.cfg.commission_per_contract
+        net = gross - fees
+        self.equity += net
+
+        if final_close:
+            risk_per_contract = abs(p.entry - p.stop) / self.cfg.tick_size * self.cfg.tick_value
+            total_risk = max(1.0, risk_per_contract * p.qty)
+            r_mult = net / total_risk
+            self.logs.append(
+                TradeLog(
+                    opened_at=p.opened_at,
+                    closed_at=bar.ts,
+                    direction="LONG" if p.is_long else "SHORT",
+                    qty=p.qty,
+                    score=p.score,
+                    tier=p.tier,
+                    gross_pnl=gross,
+                    net_pnl=net,
+                    r_multiple=r_mult,
+                    reason=reason,
+                )
+            )
+            if net < 0:
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
+            self.position = None
+
+    def manage_position(self, bar: Bar):
+        if not self.position:
+            return
+        p = self.position
+
+        # TP1
+        if not p.tp1_hit and ((p.is_long and bar.high >= p.tp1) or (not p.is_long and bar.low <= p.tp1)):
+            p.tp1_hit = True
+            close_qty = max(1, round(p.qty * self.cfg.tp1_size))
+            self._close_leg(p.tp1, close_qty, "TP1", bar, final_close=False)
+            p.stop = p.entry  # breakeven
+
+        # TP2
+        if p.tp1_hit and not p.tp2_hit and ((p.is_long and bar.high >= p.tp2) or (not p.is_long and bar.low <= p.tp2)):
+            p.tp2_hit = True
+            close_qty = max(1, round(p.qty * self.cfg.tp2_size))
+            self._close_leg(p.tp2, close_qty, "TP2", bar, final_close=False)
+            p.stop = p.tp1
+
+        # TP3
+        if p.tp1_hit and p.tp2_hit and ((p.is_long and bar.high >= p.tp3) or (not p.is_long and bar.low <= p.tp3)):
+            self._close_leg(p.tp3, p.qty, "TP3", bar, final_close=True)
+            return
+
+        # Stop
+        if (p.is_long and bar.low <= p.stop) or (not p.is_long and bar.high >= p.stop):
+            self._close_leg(p.stop, p.qty, "STOP", bar, final_close=True)
+
+    # ---------- main loop ----------
+    def run(self) -> Dict[str, float]:
+        htf_cursor = 0
+        htf_slice: List[Bar] = []
+
+        for i in range(len(self.bars_5m)):
+            bar = self.bars_5m[i]
+
+            while htf_cursor < len(self.bars_1h) and self.bars_1h[htf_cursor].ts <= bar.ts:
+                htf_slice.append(self.bars_1h[htf_cursor])
+                htf_cursor += 1
+
+            if self.position:
+                self.manage_position(bar)
+                continue
+
+            if i < 30:
+                continue
+            ltf_slice = self.bars_5m[: i + 1]
+            if not self.in_kill_zone(bar.ts):
+                continue
+            if not self.day_guardrails(bar.ts):
+                continue
+
+            bias = self.get_htf_bias(htf_slice)
+            ob = self.detect_order_blocks(ltf_slice)
+            fvg = self.detect_fvg(ltf_slice)
+            liq = self.detect_liquidity_sweep(ltf_slice)
+            mss = self.detect_mss(ltf_slice)
+            signal = self.score_setup(bias, ob, fvg, liq, mss)
+            if not signal.direction or signal.score < self.cfg.min_score:
+                continue
+
+            trend = self.analyze_trend(ltf_slice, htf_slice, signal)
+            if trend["projected_move"] < trend["atr"] * 1.1:
+                continue
+            self.open_position(bar, signal, ob, fvg, trend)
+
+        net = self.equity - self.cfg.account_size
+        wins = sum(1 for t in self.logs if t.net_pnl > 0)
+        losses = sum(1 for t in self.logs if t.net_pnl <= 0)
+        win_rate = wins / len(self.logs) if self.logs else 0.0
+
+        return {
+            "starting_equity": self.cfg.account_size,
+            "ending_equity": self.equity,
+            "net_pnl": net,
+            "trades": len(self.logs),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "avg_net_pnl": (net / len(self.logs)) if self.logs else 0.0,
+        }
+
+
+def parse_dt(s: str) -> datetime:
+    # Accepts ISO8601 with or without timezone; naive treated as UTC.
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC_TZ)
+    return dt.astimezone(UTC_TZ)
+
+
+def load_bars_csv(path: str) -> List[Bar]:
+    out = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            out.append(
+                Bar(
+                    ts=parse_dt(r["timestamp"]),
+                    open=float(r["open"]),
+                    high=float(r["high"]),
+                    low=float(r["low"]),
+                    close=float(r["close"]),
+                )
+            )
+    out.sort(key=lambda b: b.ts)
+    return out
+
+
+def print_summary(summary: Dict[str, float]):
+    print("=== Backtest Summary ===")
+    for k, v in summary.items():
+        if isinstance(v, float):
+            if "rate" in k:
+                print(f"{k}: {v:.2%}")
+            else:
+                print(f"{k}: {v:,.2f}")
+        else:
+            print(f"{k}: {v}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="ICT NQ backtester (modular, live-trading-ready foundation)")
+    p.add_argument("--bars5m", required=True, help="CSV with columns: timestamp,open,high,low,close")
+    p.add_argument("--bars1h", required=True, help="CSV with columns: timestamp,open,high,low,close")
+    args = p.parse_args()
+
+    bars5m = load_bars_csv(args.bars5m)
+    bars1h = load_bars_csv(args.bars1h)
+
+    cfg = StrategyConfig()
+    bt = Backtester(cfg, bars5m, bars1h)
+    summary = bt.run()
+    print_summary(summary)
+
+
+if __name__ == "__main__":
+    main()
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+from dataclasses import dataclass, field
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+from typing import List, Optional, Dict, Tuple
+
+
+NY_TZ = ZoneInfo("America/New_York")
+UTC_TZ = ZoneInfo("UTC")
+
+
+@dataclass
+class Bar:
+    ts: datetime  # UTC
+    open: float
+    high: float
+    low: float
+    close: float
+
+
+@dataclass
+class RiskTier:
+    min_score: int
+    risk_pct: float
+    label: str
+
+
+@dataclass
+class StrategyConfig:
+    symbol: str = "NQ"
+    account_size: float = 50_000.0
+
+    base_risk_pct: float = 0.005
+    max_risk_pct: float = 0.02
+    risk_tiers: List[RiskTier] = field(
+        default_factory=lambda: [
+            RiskTier(90, 0.020, "ELITE"),
+            RiskTier(75, 0.015, "STRONG"),
+            RiskTier(60, 0.010, "MODERATE"),
+            RiskTier(50, 0.005, "STANDARD"),
+        ]
+    )
+
+    atr_period: int = 14
+    atr_multiplier_sl: float = 1.5
+    atr_expansion_window: int = 5
+    atr_expansion_threshold: float = 1.3
+
+    tp1_ratio: float = 1.5
+    tp2_ratio: float = 2.5
+    tp3_ratio: float = 4.0
+    tp1_size: float = 0.40
+    tp2_size: float = 0.40
+    tp3_size: float = 0.20
+
+    ob_lookback: int = 10
+    fvg_min_size: float = 5.0
+    liq_lookback: int = 20
+    mss_confirm_bars: int = 2
+    min_score: int = 50
+
+    trade_only_kill_zone: bool = True
+    kill_zones: Tuple[Tuple[time, time], ...] = (
+        (time(3, 0), time(5, 0)),
+        (time(9, 30), time(11, 0)),
+        (time(13, 30), time(15, 0)),
+    )
+
+    # improvements from simulation
+    slippage_ticks: int = 2
+    commission_per_contract: float = 2.5
+    tick_size: float = 0.25
+    tick_value: float = 5.0
+
+    max_daily_loss: float = 1500.0
+    max_consecutive_losses: int = 3
+    require_regime_for_aggressive_tiers: bool = True
+
+
+@dataclass
+class Signal:
+    direction: Optional[str]
+    score: int
+    reasons: List[str]
+
+
+@dataclass
+class Position:
+    is_long: bool
+    qty: int
+    entry: float
+    stop: float
+    tp1: float
+    tp2: float
+    tp3: float
+    tier: str
+    score: int
+    opened_at: datetime
+    tp1_hit: bool = False
+    tp2_hit: bool = False
+
+
+@dataclass
+class TradeLog:
+    opened_at: datetime
+    closed_at: datetime
+    direction: str
+    qty: int
+    score: int
+    tier: str
+    gross_pnl: float
+    net_pnl: float
+    r_multiple: float
+    reason: str
+
+
+class Backtester:
+    def __init__(self, cfg: StrategyConfig, bars_5m: List[Bar], bars_1h: List[Bar]):
+        self.cfg = cfg
+        self.bars_5m = bars_5m
+        self.bars_1h = bars_1h
+        self.h1_by_time = {b.ts: b for b in bars_1h}
+
+        self.equity = cfg.account_size
+        self.position: Optional[Position] = None
+        self.logs: List[TradeLog] = []
+
+        self.current_day = None
+        self.day_start_equity = self.equity
+        self.consecutive_losses = 0
+        self.day_locked = False
+
+    # ---------- indicators ----------
+    def calc_atr(self, bars: List[Bar], period: int) -> Optional[float]:
+        if len(bars) < period + 1:
+            return None
+        trs = []
+        for i in range(len(bars) - period, len(bars)):
+            h, l, pc = bars[i].high, bars[i].low, bars[i - 1].close
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        return sum(trs) / period
+
+    def get_htf_bias(self, htf_slice: List[Bar]) -> str:
+        if len(htf_slice) < 21:
+            return "NEUTRAL"
+        ema = htf_slice[0].close
+        k = 2 / 21
+        for bar in htf_slice[1:]:
+            ema = bar.close * k + ema * (1 - k)
+        last = htf_slice[-1].close
+        if last > ema * 1.002:
+            return "BULLISH"
+        if last < ema * 0.998:
+            return "BEARISH"
+        return "NEUTRAL"
+
+    def get_htf_slope(self, htf_slice: List[Bar], lookback: int = 8) -> float:
+        if len(htf_slice) < lookback:
+            return 0.0
+        return htf_slice[-1].close - htf_slice[-lookback].close
+
+    def detect_order_blocks(self, bars: List[Bar]) -> Dict[str, Optional[Dict[str, float]]]:
+        result = {"bullish": None, "bearish": None}
+        if len(bars) < self.cfg.ob_lookback + 3:
+            return result
+        for i in range(len(bars) - self.cfg.ob_lookback, len(bars) - 2):
+            c, n, n2 = bars[i], bars[i + 1], bars[i + 2]
+            if c.close < c.open and n.close > c.high and n2.close > n.high:
+                result["bullish"] = {"high": c.high, "low": c.low}
+            if c.close > c.open and n.close < c.low and n2.close < n.low:
+                result["bearish"] = {"high": c.high, "low": c.low}
+        return result
+
+    def detect_fvg(self, bars: List[Bar]) -> Dict[str, Optional[Dict[str, float]]]:
+        result = {"bullish": None, "bearish": None}
+        if len(bars) < 4:
+            return result
+        for i in range(len(bars) - 4, len(bars) - 2):
+            prev, nxt = bars[i], bars[i + 2]
+            if nxt.low - prev.high >= self.cfg.fvg_min_size:
+                result["bullish"] = {"bottom": prev.high, "top": nxt.low}
+            if prev.low - nxt.high >= self.cfg.fvg_min_size:
+                result["bearish"] = {"bottom": nxt.high, "top": prev.low}
+        return result
+
+    def detect_liquidity_sweep(self, bars: List[Bar]) -> Dict[str, Optional[float]]:
+        out = {"swept_high": False, "swept_low": False, "high_level": None, "low_level": None}
+        if len(bars) < self.cfg.liq_lookback + 2:
+            return out
+
+        hi = max(b.high for b in bars[-self.cfg.liq_lookback - 1 : -1])
+        lo = min(b.low for b in bars[-self.cfg.liq_lookback - 1 : -1])
+        c = bars[-1]
+        if c.high > hi and c.close < hi:
+            out["swept_high"] = True
+            out["high_level"] = hi
+        if c.low < lo and c.close > lo:
+            out["swept_low"] = True
+            out["low_level"] = lo
+        return out
+
+    def detect_mss(self, bars: List[Bar]) -> Optional[str]:
+        n = len(bars)
+        if n < 10:
+            return None
+        swing_high, swing_low = -math.inf, math.inf
+        for i in range(n - 8, n - self.cfg.mss_confirm_bars):
+            b = bars[i]
+            if b.high > bars[i - 1].high and b.high > bars[i + 1].high:
+                swing_high = b.high
+            if b.low < bars[i - 1].low and b.low < bars[i + 1].low:
+                swing_low = b.low
+
+        above = all(bars[i].close > swing_high for i in range(n - self.cfg.mss_confirm_bars, n)) if swing_high != -math.inf else False
+        below = all(bars[i].close < swing_low for i in range(n - self.cfg.mss_confirm_bars, n)) if swing_low != math.inf else False
+
+        if above:
+            return "BULLISH_MSS"
+        if below:
+            return "BEARISH_MSS"
+        return None
+
+    def score_setup(self, bias: str, ob: dict, fvg: dict, liq: dict, mss: Optional[str]) -> Signal:
+        score = 0
+        reasons = []
+
+        if bias == "BULLISH":
+            if ob["bullish"]:
+                score += 25
+                reasons.append("Bullish OB")
+            if fvg["bullish"]:
+                score += 25
+                reasons.append("Bullish FVG")
+            if liq["swept_low"]:
+                score += 25
+                reasons.append("Buy-side liquidity sweep")
+            if mss == "BULLISH_MSS":
+                score += 25
+                reasons.append("Bullish MSS")
+            return Signal("LONG" if score >= self.cfg.min_score else None, score, reasons)
+
+        if bias == "BEARISH":
+            if ob["bearish"]:
+                score += 25
+                reasons.append("Bearish OB")
+            if fvg["bearish"]:
+                score += 25
+                reasons.append("Bearish FVG")
+            if liq["swept_high"]:
+                score += 25
+                reasons.append("Sell-side liquidity sweep")
+            if mss == "BEARISH_MSS":
+                score += 25
+                reasons.append("Bearish MSS")
+            return Signal("SHORT" if score >= self.cfg.min_score else None, score, reasons)
+
+        return Signal(None, score, reasons)
+
+    def analyze_trend(self, ltf_slice: List[Bar], htf_slice: List[Bar], signal: Signal) -> Dict[str, float | bool | str]:
+        atr = self.calc_atr(ltf_slice, self.cfg.atr_period) or 10.0
+
+        recent_atr = 0.0
+        if len(ltf_slice) >= self.cfg.atr_expansion_window + 1:
+            tr_sum = 0.0
+            for i in range(len(ltf_slice) - self.cfg.atr_expansion_window, len(ltf_slice)):
+                h, l, pc = ltf_slice[i].high, ltf_slice[i].low, ltf_slice[i - 1].close
+                tr_sum += max(h - l, abs(h - pc), abs(l - pc))
+            recent_atr = tr_sum / self.cfg.atr_expansion_window
+
+        atr_expansion = (recent_atr / atr) if recent_atr > 0 else 1.0
+        is_trending = atr_expansion >= self.cfg.atr_expansion_threshold
+
+        score_factor = 1 + signal.score / 100
+        projected_move = atr * self.cfg.tp2_ratio * score_factor * (atr_expansion if is_trending else 1.0)
+
+        if signal.score >= 90:
+            strength = "ELITE"
+        elif signal.score >= 75:
+            strength = "STRONG"
+        elif signal.score >= 60:
+            strength = "MODERATE"
+        elif signal.score >= 50:
+            strength = "STANDARD"
+        else:
+            strength = "WEAK"
+
+        htf_slope = self.get_htf_slope(htf_slice)
+
+        return {
+            "atr": atr,
+            "atr_expansion": atr_expansion,
+            "is_trending": is_trending,
+            "projected_move": projected_move,
+            "strength": strength,
+            "htf_slope": htf_slope,
+        }
+
+    # ---------- risk ----------
+    def in_kill_zone(self, ts_utc: datetime) -> bool:
+        if not self.cfg.trade_only_kill_zone:
+            return True
+        local_t = ts_utc.astimezone(NY_TZ).time()
+        return any(start <= local_t <= end for start, end in self.cfg.kill_zones)
+
+    def day_guardrails(self, ts_utc: datetime) -> bool:
+        day = ts_utc.astimezone(NY_TZ).date()
+        if day != self.current_day:
+            self.current_day = day
+            self.day_start_equity = self.equity
+            self.day_locked = False
+            self.consecutive_losses = 0
+
+        daily_pnl = self.equity - self.day_start_equity
+        if daily_pnl <= -abs(self.cfg.max_daily_loss):
+            self.day_locked = True
+        if self.consecutive_losses >= self.cfg.max_consecutive_losses:
+            self.day_locked = True
+
+        return not self.day_locked
+
+    def pick_tier(self, score: int) -> RiskTier:
+        for tier in self.cfg.risk_tiers:
+            if score >= tier.min_score:
+                return tier
+        return self.cfg.risk_tiers[-1]
+
+    def allow_aggressive_tier(self, tier: RiskTier, trend: dict, signal: Signal) -> bool:
+        if not self.cfg.require_regime_for_aggressive_tiers:
+            return True
+        if tier.label not in {"ELITE", "STRONG"}:
+            return True
+
+        # Require ATR expansion + direction-aligned HTF slope
+        slope = trend["htf_slope"]
+        direction_ok = (signal.direction == "LONG" and slope > 0) or (signal.direction == "SHORT" and slope < 0)
+        return bool(trend["is_trending"] and direction_ok)
+
+    def size_position(self, score: int, atr: float, trend: dict, signal: Signal) -> Tuple[int, RiskTier, float, float]:
+        tier = self.pick_tier(score)
+        if not self.allow_aggressive_tier(tier, trend, signal):
+            tier = RiskTier(60, 0.010, "MODERATE") if score >= 60 else RiskTier(50, 0.005, "STANDARD")
+
+        expansion_mult = min(1.5, trend["atr_expansion"]) if trend["is_trending"] else 1.0
+        risk_pct = min(tier.risk_pct * expansion_mult, self.cfg.max_risk_pct)
+
+        risk_amount = self.equity * risk_pct
+        sl_distance = atr * self.cfg.atr_multiplier_sl
+        sl_ticks = max(1, round(sl_distance / self.cfg.tick_size))
+        per_contract_risk = sl_ticks * self.cfg.tick_value
+        qty = max(1, int(risk_amount // per_contract_risk))
+
+        return qty, tier, risk_pct, sl_distance
+
+    # ---------- execution ----------
+    def apply_slippage(self, price: float, is_long: bool, is_entry: bool) -> float:
+        slip = self.cfg.slippage_ticks * self.cfg.tick_size
+        if is_entry:
+            return price + slip if is_long else price - slip
+        return price - slip if is_long else price + slip
+
+    def open_position(self, bar: Bar, signal: Signal, ob: dict, fvg: dict, trend: dict):
+        is_long = signal.direction == "LONG"
+        ref = (
+            (ob["bullish"]["high"] if ob["bullish"] else (fvg["bullish"]["bottom"] if fvg["bullish"] else bar.close))
+            if is_long
+            else (ob["bearish"]["low"] if ob["bearish"] else (fvg["bearish"]["top"] if fvg["bearish"] else bar.close))
+        )
+
+        qty, tier, _, sl_dist = self.size_position(signal.score, float(trend["atr"]), trend, signal)
+        tp_mult = min(1.5, float(trend["atr_expansion"])) if trend["is_trending"] else 1.0
+
+        raw_entry = ref
+        entry = self.apply_slippage(raw_entry, is_long=is_long, is_entry=True)
+        stop = entry - sl_dist if is_long else entry + sl_dist
+        tp1 = entry + sl_dist * self.cfg.tp1_ratio if is_long else entry - sl_dist * self.cfg.tp1_ratio
+        tp2 = entry + sl_dist * self.cfg.tp2_ratio * tp_mult if is_long else entry - sl_dist * self.cfg.tp2_ratio * tp_mult
+        tp3 = entry + sl_dist * self.cfg.tp3_ratio * tp_mult * 1.2 if is_long else entry - sl_dist * self.cfg.tp3_ratio * tp_mult * 1.2
+
+        self.position = Position(is_long, qty, entry, stop, tp1, tp2, tp3, tier.label, signal.score, bar.ts)
+
+    def _close_leg(self, exit_price: float, qty: int, reason: str, bar: Bar, final_close: bool = False):
+        assert self.position is not None
+        p = self.position
+        signed = 1 if p.is_long else -1
+        slipped_exit = self.apply_slippage(exit_price, is_long=p.is_long, is_entry=False)
+        gross = (slipped_exit - p.entry) * signed * (qty * 4)  # $4/point/contract equivalent from provided script
+        fees = qty * self.cfg.commission_per_contract
+        net = gross - fees
+        self.equity += net
+
+        if final_close:
+            risk_per_contract = abs(p.entry - p.stop) / self.cfg.tick_size * self.cfg.tick_value
+            total_risk = max(1.0, risk_per_contract * p.qty)
+            r_mult = net / total_risk
+            self.logs.append(
+                TradeLog(
+                    opened_at=p.opened_at,
+                    closed_at=bar.ts,
+                    direction="LONG" if p.is_long else "SHORT",
+                    qty=p.qty,
+                    score=p.score,
+                    tier=p.tier,
+                    gross_pnl=gross,
+                    net_pnl=net,
+                    r_multiple=r_mult,
+                    reason=reason,
+                )
+            )
+            if net < 0:
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
+            self.position = None
+
+    def manage_position(self, bar: Bar):
+        if not self.position:
+            return
+        p = self.position
+
+        # TP1
+        if not p.tp1_hit and ((p.is_long and bar.high >= p.tp1) or (not p.is_long and bar.low <= p.tp1)):
+            p.tp1_hit = True
+            close_qty = max(1, round(p.qty * self.cfg.tp1_size))
+            self._close_leg(p.tp1, close_qty, "TP1", bar, final_close=False)
+            p.stop = p.entry  # breakeven
+
+        # TP2
+        if p.tp1_hit and not p.tp2_hit and ((p.is_long and bar.high >= p.tp2) or (not p.is_long and bar.low <= p.tp2)):
+            p.tp2_hit = True
+            close_qty = max(1, round(p.qty * self.cfg.tp2_size))
+            self._close_leg(p.tp2, close_qty, "TP2", bar, final_close=False)
+            p.stop = p.tp1
+
+        # TP3
+        if p.tp1_hit and p.tp2_hit and ((p.is_long and bar.high >= p.tp3) or (not p.is_long and bar.low <= p.tp3)):
+            self._close_leg(p.tp3, p.qty, "TP3", bar, final_close=True)
+            return
+
+        # Stop
+        if (p.is_long and bar.low <= p.stop) or (not p.is_long and bar.high >= p.stop):
+            self._close_leg(p.stop, p.qty, "STOP", bar, final_close=True)
+
+    # ---------- main loop ----------
+    def run(self) -> Dict[str, float]:
+        htf_cursor = 0
+        htf_slice: List[Bar] = []
+
+        for i in range(len(self.bars_5m)):
+            bar = self.bars_5m[i]
+
+            while htf_cursor < len(self.bars_1h) and self.bars_1h[htf_cursor].ts <= bar.ts:
+                htf_slice.append(self.bars_1h[htf_cursor])
+                htf_cursor += 1
+
+            if self.position:
+                self.manage_position(bar)
+                continue
+
+            if i < 30:
+                continue
+            ltf_slice = self.bars_5m[: i + 1]
+            if not self.in_kill_zone(bar.ts):
+                continue
+            if not self.day_guardrails(bar.ts):
+                continue
+
+            bias = self.get_htf_bias(htf_slice)
+            ob = self.detect_order_blocks(ltf_slice)
+            fvg = self.detect_fvg(ltf_slice)
+            liq = self.detect_liquidity_sweep(ltf_slice)
+            mss = self.detect_mss(ltf_slice)
+            signal = self.score_setup(bias, ob, fvg, liq, mss)
+            if not signal.direction or signal.score < self.cfg.min_score:
+                continue
+
+            trend = self.analyze_trend(ltf_slice, htf_slice, signal)
+            if trend["projected_move"] < trend["atr"] * 1.1:
+                continue
+            self.open_position(bar, signal, ob, fvg, trend)
+
+        net = self.equity - self.cfg.account_size
+        wins = sum(1 for t in self.logs if t.net_pnl > 0)
+        losses = sum(1 for t in self.logs if t.net_pnl <= 0)
+        win_rate = wins / len(self.logs) if self.logs else 0.0
+
+        return {
+            "starting_equity": self.cfg.account_size,
+            "ending_equity": self.equity,
+            "net_pnl": net,
+            "trades": len(self.logs),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "avg_net_pnl": (net / len(self.logs)) if self.logs else 0.0,
+        }
+
+
+def parse_dt(s: str) -> datetime:
+    # Accepts ISO8601 with or without timezone; naive treated as UTC.
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC_TZ)
+    return dt.astimezone(UTC_TZ)
+
+
+def load_bars_csv(path: str) -> List[Bar]:
+    out = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            out.append(
+                Bar(
+                    ts=parse_dt(r["timestamp"]),
+                    open=float(r["open"]),
+                    high=float(r["high"]),
+                    low=float(r["low"]),
+                    close=float(r["close"]),
+                )
+            )
+    out.sort(key=lambda b: b.ts)
+    return out
+
+
+def print_summary(summary: Dict[str, float]):
+    print("=== Backtest Summary ===")
+    for k, v in summary.items():
+        if isinstance(v, float):
+            if "rate" in k:
+                print(f"{k}: {v:.2%}")
+            else:
+                print(f"{k}: {v:,.2f}")
+        else:
+            print(f"{k}: {v}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="ICT NQ backtester (modular, live-trading-ready foundation)")
+    p.add_argument("--bars5m", required=True, help="CSV with columns: timestamp,open,high,low,close")
+    p.add_argument("--bars1h", required=True, help="CSV with columns: timestamp,open,high,low,close")
+    args = p.parse_args()
+
+    bars5m = load_bars_csv(args.bars5m)
+    bars1h = load_bars_csv(args.bars1h)
+
+    cfg = StrategyConfig()
+    bt = Backtester(cfg, bars5m, bars1h)
+    summary = bt.run()
+    print_summary(summary)
+
+
+if __name__ == "__main__":
+    main()
